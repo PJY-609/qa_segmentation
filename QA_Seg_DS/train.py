@@ -3,10 +3,10 @@ from lib.training.train import train
 Config = {
 	"data_config": {
 		"k_train_excels": [
-			"D:/QA/QA_Seg/preprocess/k_fold/fold1/train.xlsx"
+			"./preprocess/k_fold/fold0/train.xlsx"
 			],
 		"k_val_excels": [
-			"D:/QA/QA_Seg/preprocess/k_fold/fold1/val.xlsx"
+			"./preprocess/k_fold/fold0/val.xlsx"
 			],
 		"image_header": "image",
 		"mask_header": "scapula",
@@ -33,8 +33,8 @@ Config = {
 		"loss_function": {"loss": "dc_and_ce", "weights": [1.]},
 		
 		"accum_grad": 6,
-		"resume_training": None,
-		"experiment_name": "scapula_ds",
+		"resume_training": "D:\\QA\\QA_Seg\\logs\\scapula_unet_deep_supervise\\version_0\\checkpoints\\last.ckpt",
+		"experiment_name": "scapula_unet_deep_supervise",
 		"log_dir": "logs",
 		"earlystop_patience": 10
 	}

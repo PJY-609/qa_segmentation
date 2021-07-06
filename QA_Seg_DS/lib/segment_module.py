@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 from functools import partial
 import os
 from pathlib import Path
+import SimpleITK as sitk
 
 from lib.training.dataset import TrainDataset
 from lib.models.unet import UNet
@@ -15,10 +16,12 @@ from lib.models.unet import UNet
 from lib.training.loss import DCandCELoss
 from lib.training.metrics import DiceCoefficient
 
-from lib.inference.utils import write_nii, interpolate, makedirs
+from lib.inference.utils import write_nii, makedirs, postprocess
 from lib.inference.dataset import TestDataset, patch_generator
+from lib.evaluation.calculate_metrics import measure_overlap, measure_surface, bootstrap_confidence_interval
+from lib.evaluation.utils import metric_logging
 from lib.patch import reconstruct_from_patches, sample_patch_by_sliwin
-from lib.utils import read_image
+from lib.utils import read_image, whd_2_hwd
 
 
 def collate_fn(x):
@@ -39,8 +42,6 @@ class SegmentModule(pl.LightningModule):
         if stage == 'fit':
             self.loss = self.configure_loss()
             self.metric_fn = DiceCoefficient()
-        elif stage == 'test':
-            makedirs(self.test_config["result_dir"])
 
     def train_dataloader(self):
         train_ds = TrainDataset(
@@ -73,7 +74,15 @@ class SegmentModule(pl.LightningModule):
         return val_loader
 
     def test_dataloader(self):
-        test_ds = TestDataset(self.test_config["test_excel"], self.test_config["patch_size"], self.test_config["normalization"])
+        test_ds = TestDataset(
+            self.test_config["test_excel"], 
+            self.test_config["image_header"], 
+            self.test_config["mask_header"], 
+            self.test_config["selected_labels"], 
+            self.test_config["patch_size"], 
+            self.test_config["pixval_replacement"], 
+            self.test_config["new_spacing"], 
+            self.test_config["normalization"])
         return DataLoader(test_ds, batch_size=1, collate_fn=collate_fn, drop_last=False)
 
     def configure_model(self):
@@ -114,7 +123,10 @@ class SegmentModule(pl.LightningModule):
 
         logits = self.model(data)
         
-        loss = 0.25 * self.loss(logits[0], target) + 0.5 * self.loss(logits[1], target) + self.loss(logits[2], target)
+        target_4 = F.interpolate(target.float(), scale_factor=0.25, mode='nearest', align_corners=None).long()
+        target_2 = F.interpolate(target.float(), scale_factor=0.5, mode='nearest', align_corners=None).long()
+
+        loss = 0.25 * self.loss(logits[0], target_4) + 0.5 * self.loss(logits[1], target_2) + self.loss(logits[2], target)
 
         metrics = self.metric_fn(logits[2], target)
 
@@ -129,7 +141,10 @@ class SegmentModule(pl.LightningModule):
 
         logits = self.model(data)
         
-        loss = 0.25 * self.loss(logits[0], target) + 0.5 * self.loss(logits[1], target) + self.loss(logits[2], target)
+        target_4 = F.interpolate(target.float(), scale_factor=0.25, mode='nearest', align_corners=None).long()
+        target_2 = F.interpolate(target.float(), scale_factor=0.5, mode='nearest', align_corners=None).long()
+
+        loss = 0.25 * self.loss(logits[0], target_4) + 0.5 * self.loss(logits[1], target_2) + self.loss(logits[2], target)
 
         metrics = self.metric_fn(logits[2], target)
 
@@ -141,43 +156,64 @@ class SegmentModule(pl.LightningModule):
     
 
     def test_step(self, batch, batchidx):
-        # if batch["patch_indices"] is None:
-        #     predictions = self.test_on_whole(batch["image"], batch["org_size"])
-        # else:
-        prediction = self.test_on_patch(batch["image"], batch["patch_indices"], batch["org_size"], batch["fine_patch_size"])
+        prediction = self.predict_on_batch(batch["sitk_image"], batch["sitk_raw_image"])
 
-        np.save(os.path.join(self.test_config["result_dir"], Path(batch["path"]).stem), prediction)
+        overlap_metrics = measure_overlap(batch["mask"], prediction, self.test_config["overlap_metrics"], len(self.test_config["selected_labels"]))
+        surface_metrics = measure_surface(batch["mask"], prediction, self.test_config["surface_metrics"], len(self.test_config["selected_labels"]), whd_2_hwd(batch["sitk_raw_image"].GetSpacing()))
+        
+        log = {}
+        metric_logging(log, self.test_config["overlap_metrics"], self.test_config["mask_header"], self.test_config["selected_labels"], overlap_metrics)
+        metric_logging(log, self.test_config["surface_metrics"], self.test_config["mask_header"], self.test_config["selected_labels"], surface_metrics)
+        
+        self.log_dict(log, on_step=True, on_epoch=True)
 
-    def test_on_whole(self, image, org_size):
-        image_batch = np.repeat(image[np.newaxis, ...], self.test_config['batch_size'], axis=0)
-        image_batch = np.moveaxis(image_batch, -1, 1)
-        image_batch = torch.from_numpy(image_batch).to(device=self.device, dtype=torch.float)
+        return overlap_metrics, surface_metrics
 
-        all_logits = self.model(image_batch)
+    def test_epoch_end(self, outputs):
+        outputs = np.asarray(outputs)
+        outputs = np.moveaxis(outputs, 0, -1)
+        all_overlap_metrics, all_surface_metrics = outputs
+
+        log = {}
+        overlap_ci_names = ["ci_" + m for m in self.test_config["overlap_metrics"]]
+        surface_ci_names = ["ci_" + m for m in self.test_config["surface_metrics"]]
+        
+        mask_overlap_intervals = [[bootstrap_confidence_interval(m) for m in label_metrics] for label_metrics in all_overlap_metrics]
+        metric_logging(log, overlap_ci_names, self.test_config["mask_header"], self.test_config["selected_labels"], mask_overlap_intervals)
+
+        mask_surface_intervals = [[bootstrap_confidence_interval(m) for m in label_metrics] for label_metrics in all_surface_metrics]
+        metric_logging(log, surface_ci_names, self.test_config["mask_header"], self.test_config["selected_labels"], mask_surface_intervals)
     
-        all_preds = [F.softmax(logits, axis=1) for logits in all_logits]
+        self.log_dict(log)
 
-        predictions = [preds[self.test_config['batch_size'] // 2].detach().cpu().numpy() for preds in all_preds]
 
-        predictions = interpolate(preditions, org_size)
+    def predict_on_batch(self, sitk_image, sitk_raw_image):
+        size, spacing = whd_2_hwd(sitk_image.GetSize()), whd_2_hwd(sitk_image.GetSpacing())
+        raw_size, raw_spacing = whd_2_hwd(sitk_raw_image.GetSize()), whd_2_hwd(sitk_raw_image.GetSpacing())
 
-        return predictions
+        if len(self.test_config["patch_size"]) == 2:
+            spacing, raw_spacing = spacing[:-1], raw_spacing[:-1]
+            size, raw_size = size[:-1], raw_size[:-1]
 
-    def test_on_patch(self, image, patch_indices, org_size, fine_patch_size):
-        fine_patch_indices = sample_patch_by_sliwin(np.array(org_size), fine_patch_size, fine_patch_size // 2)
+        raw_patch_size = np.ceil(np.multiply(self.test_config["patch_size"], np.divide(spacing, raw_spacing))).astype(np.int32)
+
+        raw_patch_indices = sample_patch_by_sliwin(np.array(raw_size), raw_patch_size, raw_patch_size // 2)
+        patch_indices = sample_patch_by_sliwin(np.array(size), self.test_config["patch_size"], np.array(self.test_config["patch_size"]) // 2)
+
+        image = np.moveaxis(sitk.GetArrayFromImage(sitk_image), 0, -1)
 
         patch_gen = patch_generator(image, patch_indices, self.test_config["patch_size"], self.test_config["batch_size"], self.device)
 
-        all_patch_logits = [self.model(image_batch)[2] for image_batch in patch_gen]
-        all_patch_logits = torch.cat(all_patch_logits, axis=0)
-        restore_patch = partial(self.restore_patch, fine_patch_size=fine_patch_size, fine_patch_indices=fine_patch_indices, org_size=org_size)
-        reconstruction = restore_patch(all_patch_logits)
-        reconstruction = np.moveaxis(reconstruction[np.newaxis, ...], -1, 1)
-        return reconstruction
+        all_patch_logits = torch.cat([self.model(image_batch)[2] for image_batch in patch_gen], axis=0)
 
-    def restore_patch(self, patch_logits, fine_patch_size, fine_patch_indices, org_size):
-        patch_logits = F.interpolate(patch_logits, size=fine_patch_size.tolist(), mode='bilinear')
+        reconstruction = self.restore_patch(all_patch_logits, raw_patch_size=raw_patch_size, raw_patch_indices=raw_patch_indices, raw_size=raw_size)
+        
+        prediction = postprocess(reconstruction, len(self.test_config["selected_labels"]), self.test_config["n_largest_components"])
+        return prediction
+
+    def restore_patch(self, patch_logits, raw_patch_size, raw_patch_indices, raw_size):
+        patch_logits = F.interpolate(patch_logits, size=raw_patch_size.tolist(), mode='bilinear')
         patch_logits = torch.movedim(patch_logits, 1, -1).detach().cpu().numpy()
-        reconstruction = reconstruct_from_patches(patch_logits, fine_patch_indices, org_size)
+        reconstruction = reconstruct_from_patches(patch_logits, raw_patch_indices, raw_size)
         reconstruction = F.softmax(torch.from_numpy(reconstruction), dim=-1).numpy()
         return reconstruction

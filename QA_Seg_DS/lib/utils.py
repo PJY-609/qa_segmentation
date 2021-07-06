@@ -12,7 +12,12 @@ def get_info_reader(path):
 def read_image(path):
     image = sitk.ReadImage(path)
     image = sitk.GetArrayFromImage(image)
-    image = image[..., np.newaxis]
+	
+    if image.ndim == 2:
+    	image = image[:, :, np.newaxis]
+    elif image.ndim == 3:
+    	image = np.moveaxis(image, 0, -1)
+
     return image
     
 def read_mask(path, selected_labels):
@@ -44,3 +49,32 @@ def intensity_normalization(x, norm):
 	elif norm == "minmax":
 		x = (x - x.min() / x.max() - x.min())
 	return x
+
+
+def replace_pixval(image, pixvals):
+	POS = np.isin(image, pixvals)
+	image[POS] = image[~POS].mean()
+	return image
+
+
+def resample(image, new_spacing, interpolator):
+	old_shape, old_spacing = image.GetSize(), image.GetSpacing()
+	new_spacing = (new_spacing[0], new_spacing[1], 1.) if len(old_spacing) > len(new_spacing) else new_spacing
+
+	new_shape = np.ceil(np.multiply(old_shape, np.divide(old_spacing, new_spacing))).astype(np.int32).tolist()
+
+	resample_filter = sitk.ResampleImageFilter()
+	resample_filter.SetInterpolator(interpolator)
+	resample_filter.SetSize(new_shape)
+	resample_filter.SetOutputSpacing(new_spacing)
+	resample_filter.SetOutputDirection(image.GetDirection())
+	resample_filter.SetOutputOrigin(image.GetOrigin())
+
+	image = resample_filter.Execute(image)
+	return image
+
+
+
+def whd_2_hwd(whd):
+	w, h, d = whd
+	return (h, w, d)

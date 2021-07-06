@@ -3,9 +3,12 @@ import torch
 import pandas as pd
 from torch.utils.data import Dataset
 import math
+import SimpleITK as sitk
 
-from lib.utils import read_image, read_mask, intensity_normalization, get_info_reader
+from lib.utils import read_image, read_mask, intensity_normalization
+from lib.utils import get_info_reader, replace_pixval, resample
 from lib.patch import extract_patches, sample_patch_by_sliwin
+
 
 def patch_generator(image, patch_indices, patch_size, batch_size, device):
     steps = math.ceil(len(patch_indices) / batch_size)
@@ -18,41 +21,40 @@ def patch_generator(image, patch_indices, patch_size, batch_size, device):
 
 
 class TestDataset(Dataset):
-    def __init__(self, excel_path, patch_size, normalization):
+    def __init__(self, excel_path, image_header, mask_header, selected_labels, patch_size, pixval_replacement, new_spacing, normalization):
         df = pd.read_excel(excel_path, engine="openpyxl")
-        self.image_paths = df["image"].values
-        self.org_image_paths = df["org_image"].values
+        self.image_paths = df[image_header].values
+        self.mask_paths = df[mask_header].values
+        self.selected_labels = selected_labels
         self.patch_size = np.array(patch_size)
-        self.patch_overlap = self.patch_size // 2
+        self.pixval_replacement = pixval_replacement
+        self.new_spacing = new_spacing
         self.normalization = normalization
 
     def __len__(self):
         return len(self.image_paths)
 
     def __getitem__(self, index):
-        image = read_image(self.image_paths[index])
-        image = intensity_normalization(image, self.normalization)
+        raw_image = sitk.ReadImage(self.image_paths[index])
         
-        patch_indices = sample_patch_by_sliwin(image.shape[:-1], self.patch_size, self.patch_overlap)
-        margins = self.patch_size - np.array(image.shape[:-1])
-        if (margins > 0).all():
-            patch_indices = np.unsqueeze(np.zeros_like(self.patch_size) - margins // 2, axis=0)
+        if len(raw_image.GetSize()) == 2:
+            raw_image = sitk.JoinSeries(raw_image)
 
-        org_reader = get_info_reader(self.org_image_paths[index])
-        new_reader = get_info_reader(self.image_paths[index])
+        image = sitk.GetArrayFromImage(raw_image)
+        image = replace_pixval(image, self.pixval_replacement)
+        image = intensity_normalization(image, self.normalization)
 
-        org_size = (org_reader.GetSize()[1], org_reader.GetSize()[0])
-        org_spacing = (org_reader.GetSpacing()[1], org_reader.GetSpacing()[0])
-        new_spacing = (new_reader.GetSpacing()[1], new_reader.GetSpacing()[0])
+        image = sitk.GetImageFromArray(image)
+        image.CopyInformation(raw_image)
+        
+        image = resample(image, self.new_spacing, sitk.sitkBSpline)
 
-        fine_patch_size = np.ceil(np.multiply(self.patch_size, np.divide(new_spacing, org_spacing))).astype(np.int32)
+        mask = read_mask(self.mask_paths[index], self.selected_labels)
 
         ret = {
-            "image": image,
-            "patch_indices": patch_indices,
-            "path": self.image_paths[index],
-            "org_path": self.org_image_paths[index],
-            "org_size": org_size,
-            "fine_patch_size": fine_patch_size
+            "sitk_image": image,
+            "sitk_raw_image": raw_image,
+            "mask": mask,
+            "path": self.image_paths[index]
         }
         return ret
